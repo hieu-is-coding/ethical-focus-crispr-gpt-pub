@@ -10,13 +10,13 @@ Please review the foundation project of CRISPR-GPT to understand the core struct
 
 </div>
 
-## Problem notice
+## Problem found
 
 I notice that the safety.py are using static checking with fixed keywords that could be bypass by synonym replacement in vague context.
 
 Here is an example of tricky prompt:
 <p align="center">
-<img width="600" alt="CRISPR-GPT Overview" src="assets/safety_problem.png">
+<img width="700" alt="CRISPR-GPT Overview" src="assets/safety_problem.png">
 </p>
 As you can see in the above figure, 'adult sperm' is supported while 'human sperm' gets rejected.
 
@@ -24,14 +24,14 @@ As you can see in the above figure, 'adult sperm' is supported while 'human sper
 The idea of ethical agent is simple: ultilize safety.py functions as tools, apply basic embedding for semantic vector search, provide detailed template with various criteria for contextual reasoning (potential to apply in RLHF).
 
 <p align="center">
-<img width="600" alt="CRISPR-GPT Overview" src="assets/Ethical_Agent.jpg">
+<img width="700" alt="CRISPR-GPT Overview" src="assets/Ethical_Agent.jpg">
 </p>
 
 ## Result
 Successfully detects violated prompts and provide warning records for developer.
 
 <p align="center">
-<img width="600" alt="CRISPR-GPT Overview" src="assets/safety_result.png">
+<img width="700" alt="CRISPR-GPT Overview" src="assets/safety_result.png">
 </p>
 
 ## Limitation
