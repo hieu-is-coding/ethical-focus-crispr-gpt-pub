@@ -1,12 +1,17 @@
 from dataclasses import dataclass, field
+import numbers
 from typing import Optional, List, Any, Dict
 from llm import OpenAIChat
 from .safety import (
     check_human_heritable_editing,
     WARNING_HUMAN_HERITABLE_EDITING,
     check_stopping_keywords,
+    contains_identifiable_genes,
+    WARNING_PRIVACY,
+    _check_contains_keyword_list,
 )
 from util import get_logger
+import json
 
 logger = get_logger(__name__)
 
@@ -18,6 +23,277 @@ class Result_ProcessUserInput:
     thoughts: Optional[str] = None
     response: Optional[str] = None
 
+
+# ============================================================================
+# AI SAFETY AGENT USING GEMINI/GPT WITH TOOL CALLING
+# ============================================================================
+
+class AISafetyAgent:
+    """
+    AI Safety Agent that uses existing safety.py functions as tools.
+    Provides intelligent assessment beyond simple keyword matching.
+    """
+    
+    SYSTEM_PROMPT = """You are an expert biosafety and bioethics AI assistant for CRISPR-GPT system.
+
+Your role is to evaluate user requests for CRISPR gene editing and determine if they are safe to process.
+
+You have access to the following safety check tools:
+1. check_stopping_keywords - Checks for dangerous keywords (pathogens, germline editing, etc.)
+2. contains_identifiable_genes - Checks for human genetic sequences that may violate privacy
+3. check_human_heritable_editing - Checks for human germline/heritable editing indicators
+4. check_keyword_list - Custom keyword list checking
+
+EVALUATION PROCESS:
+1. First, use the available tools to scan the request
+2. Analyze the intent and context beyond just keywords
+3. Consider:
+   - Biosecurity risks (pathogen work, gain-of-function, dual-use)
+   - Ethical concerns (germline editing, eugenics, discrimination)
+   - Privacy violations (patient sequences, identifiable data)
+   - Hidden intent or evasion attempts
+4. Make a final safety determination
+
+RESPONSE FORMAT (JSON):
+{
+    "risk_level": "safe|low|medium|high|critical",
+    "confidence": 0.0-1.0,
+    "tool_results": {
+        "stopping_keywords": "ok or error message",
+        "identifiable_genes": true/false,
+        "heritable_editing": true/false
+    },
+    "analysis": "Your detailed analysis beyond tool results",
+    "red_flags": ["flag1", "flag2"],
+    "decision": "allow|warn|block",
+    "user_message": "Message to show the user"
+}
+
+IMPORTANT:
+- Be thorough but not overly restrictive
+- Consider legitimate research use cases
+- If tools flag issues, analyze if they're false positives
+- Provide clear explanations for your decisions
+- Default to caution when uncertain"""
+
+    def __init__(self):
+        self.call_count = 0
+    
+    def evaluate_request(self, user_message: str, memory: Dict) -> Dict:
+        """
+        Evaluate user request using AI agent with safety tools.
+        
+        Args:
+            user_message: The user's input
+            memory: Session memory containing history and context
+            
+        Returns:
+            Dict with risk_level, decision, and user_message
+        """
+        self.call_count += 1
+        
+        # Step 1: Run safety tools
+        tool_results = self._run_safety_tools(user_message)
+        
+        # Step 2: Build context
+        session_history = memory.get('message_history', [])[-5:]  # Last 5 messages
+        previous_flags = memory.get('safety_flags', [])
+        
+        # Step 3: Prepare prompt for AI agent
+        prompt = f"""{self.SYSTEM_PROMPT}
+
+=== CURRENT REQUEST ===
+"{user_message}"
+
+=== TOOL RESULTS ===
+{json.dumps(tool_results, indent=2)}
+
+=== SESSION CONTEXT ===
+Recent History (last 5 requests): {json.dumps(session_history, indent=2)}
+Previous Safety Flags: {json.dumps(previous_flags, indent=2)}
+
+=== YOUR TASK ===
+Analyze this request comprehensively and provide your safety assessment in JSON format.
+Consider:
+1. What the tools found
+2. The user's intent and context
+3. Patterns in their behavior
+4. Potential risks not caught by tools
+5. Whether this is legitimate research
+
+Provide your response in valid JSON format matching the schema above."""
+
+        try:
+            # Call AI agent (using GPT-4 as Gemini isn't in the llm.py)
+            response = OpenAIChat.chat(prompt, use_GPT4=True)
+            print("-----------  $    response: ", response)
+            
+            # Validate response
+            if not isinstance(response, dict):
+                logger.error(f"AI agent returned non-dict: {response}")
+                return self._create_fallback_assessment(tool_results)
+            
+            # Ensure required fields
+            if 'decision' not in response:
+                response['decision'] = self._infer_decision(response.get('risk_level', 'high'))
+            
+            if 'user_message' not in response:
+                response['user_message'] = self._generate_user_message(response)
+            
+            # Log assessment
+            logger.info(f"AI Safety Agent Assessment: {response.get('risk_level')} - {response.get('decision')}")
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"AI Safety Agent error: {e}")
+            # Fallback to tool-based assessment
+            return self._create_fallback_assessment(tool_results)
+    
+    def _run_safety_tools(self, user_message: str) -> Dict:
+        """Run all safety check tools from safety.py"""
+        
+        results = {}
+        
+        # Handle None or empty messages
+        if not user_message or not isinstance(user_message, str):
+            return {
+                'stopping_keywords': 'ok',
+                'identifiable_genes': False,
+                'heritable_editing': False,
+                'note': 'Empty or invalid message - skipped checks'
+            }
+        
+        # Tool 1: Check stopping keywords
+        try:
+            keyword_result = check_stopping_keywords(user_message)
+            results['stopping_keywords'] = keyword_result
+        except Exception as e:
+            logger.error(f"Tool error (stopping_keywords): {e}")
+            results['stopping_keywords'] = 'ok'  # Fail-safe to allow on error
+        
+        # Tool 2: Check for identifiable genes
+        try:
+            results['identifiable_genes'] = contains_identifiable_genes(user_message)
+        except Exception as e:
+            logger.error(f"Tool error (identifiable_genes): {e}")
+            results['identifiable_genes'] = False
+        
+        # Tool 3: Check human heritable editing
+        try:
+            results['heritable_editing'] = check_human_heritable_editing(user_message)
+        except Exception as e:
+            logger.error(f"Tool error (heritable_editing): {e}")
+            results['heritable_editing'] = False
+        
+        return results
+    
+    def _infer_decision(self, risk_level: str) -> str:
+        """Infer decision from risk level"""
+        if risk_level in ['critical', 'high']:
+            return 'block'
+        elif risk_level == 'medium':
+            return 'warn'
+        else:
+            return 'allow'
+    
+    def _generate_user_message(self, assessment: Dict) -> str:
+        """Generate user-facing message from assessment"""
+        
+        decision = assessment.get('decision', 'block')
+        risk_level = assessment.get('risk_level', 'unknown')
+        analysis = assessment.get('analysis', 'Safety check completed.')
+        red_flags = assessment.get('red_flags', [])
+        
+        if decision == 'block':
+            msg = f"🛑 **Safety Check: Request Blocked ({risk_level.upper()})**\n\n"
+            msg += f"{analysis}\n\n"
+            if red_flags:
+                msg += "**Specific Concerns:**\n"
+                for flag in red_flags:
+                    msg += f"  • {flag}\n"
+            return msg
+        
+        elif decision == 'warn':
+            msg = f"⚠️ **Safety Advisory ({risk_level.upper()})**\n\n"
+            msg += f"{analysis}\n\n"
+            if red_flags:
+                msg += "**Please Note:**\n"
+                for flag in red_flags:
+                    msg += f"  • {flag}\n"
+            msg += "\nYou may proceed, but please review these considerations carefully."
+            return msg
+        
+        else:  # allow
+            return ""  # No message needed for safe requests
+    
+    def _create_fallback_assessment(self, tool_results: Dict) -> Dict:
+        """Create assessment based purely on tool results when AI agent fails"""
+        
+        # Check if any tools flagged issues
+        keyword_result = tool_results.get('stopping_keywords', 'ok')
+        has_genes = tool_results.get('identifiable_genes', False)
+        has_heritable = tool_results.get('heritable_editing', False)
+        
+        if keyword_result != 'ok':
+            return {
+                'risk_level': 'critical',
+                'decision': 'block',
+                'user_message': keyword_result,
+                'tool_results': tool_results,
+                'analysis': 'Blocked by keyword filter',
+                'red_flags': ['Dangerous keyword detected'],
+                'confidence': 1.0
+            }
+        
+        if has_genes:
+            return {
+                'risk_level': 'high',
+                'decision': 'block',
+                'user_message': WARNING_PRIVACY,
+                'tool_results': tool_results,
+                'analysis': 'Privacy violation detected',
+                'red_flags': ['Identifiable genetic sequence detected'],
+                'confidence': 0.9
+            }
+        
+        if has_heritable:
+            return {
+                'risk_level': 'medium',
+                'decision': 'warn',
+                'user_message': WARNING_HUMAN_HERITABLE_EDITING,
+                'tool_results': tool_results,
+                'analysis': 'Human heritable editing detected',
+                'red_flags': ['Human germline/heritable editing indicators'],
+                'confidence': 0.8
+            }
+        
+        # No issues found
+        return {
+            'risk_level': 'safe',
+            'decision': 'allow',
+            'user_message': '',
+            'tool_results': tool_results,
+            'analysis': 'No safety concerns detected',
+            'red_flags': [],
+            'confidence': 0.7
+        }
+
+
+# Global AI safety agent instance
+_ai_safety_agent = None
+
+def get_ai_safety_agent() -> AISafetyAgent:
+    """Get or create the global AI safety agent instance"""
+    global _ai_safety_agent
+    if _ai_safety_agent is None:
+        _ai_safety_agent = AISafetyAgent()
+    return _ai_safety_agent
+
+
+# ============================================================================
+# ORIGINAL CLASSES WITH ENHANCED SAFETY
+# ============================================================================
 
 class BaseState:
     isFinal = False
@@ -88,26 +364,89 @@ class BaseUserInputState:
     @classmethod
     def safe_step(cls, user_message, **kwargs):
         try:
-            stopping_result = check_stopping_keywords(user_message)
-            if stopping_result != "ok":
+            # Handle None or empty messages - skip safety check for system messages
+            if user_message is None or not isinstance(user_message, str):
+                return cls.step(user_message, **kwargs)
+            
+            # Initialize message history if not exists
+            if 'message_history' not in kwargs.get('memory', {}):
+                kwargs.setdefault('memory', {})['message_history'] = []
+            
+            if(user_message.isdigit()):
+                return cls.step(user_message, **kwargs)
+
+            # Use AI Safety Agent for comprehensive evaluation
+            safety_agent = get_ai_safety_agent()
+            assessment = safety_agent.evaluate_request(
+                user_message, 
+                kwargs.get('memory', {})
+            )
+            
+            # Log assessment details
+            logger.info(f"Safety Assessment: {assessment.get('risk_level')} - {assessment.get('decision')}")
+            
+            # Handle different decisions
+            decision = assessment.get('decision', 'block')
+            user_msg = assessment.get('user_message', '')
+            
+            # Special handling for confirmation messages
+            if user_message.strip().lower() in ['confirm', 'yes', 'y', 'ok', 'proceed']:
+                logger.info(f"User confirmation received: {user_message}")
+                # Allow confirmation to proceed without additional warnings
+                decision = 'allow'
+                user_msg = ''
+            
+            if decision == 'block':
+                # Store safety flag
+                kwargs['memory'].setdefault('safety_flags', []).append({
+                    'message': user_message[:100],
+                    'risk_level': assessment.get('risk_level'),
+                    'red_flags': assessment.get('red_flags', [])
+                })
+                
                 return (
-                    Result_ProcessUserInput(status="error", response=stopping_result),
+                    Result_ProcessUserInput(status="error", response=user_msg),
                     cls,
                 )
-            elif check_human_heritable_editing(user_message) and (
-                not kwargs["memory"].get("flag_human_heritable_editing_ack", False)
-            ):
-                kwargs["memory"]["flag_human_heritable_editing_ack"] = True
-                kwargs["memory"]["cached_user_message_before_ack"] = user_message
-                return Result_ProcessUserInput(
-                    status="error", response=WARNING_HUMAN_HERITABLE_EDITING
-                ), make_check_ack_state(cls)
-            else:
+            
+            elif decision == 'warn':
+                # For human heritable editing, use the existing ACK mechanism
+                if assessment.get('tool_results', {}).get('heritable_editing'):
+                    if not kwargs["memory"].get("flag_human_heritable_editing_ack", False):
+                        kwargs["memory"]["flag_human_heritable_editing_ack"] = True
+                        kwargs["memory"]["cached_user_message_before_ack"] = user_message
+                        return Result_ProcessUserInput(
+                            status="error", response=user_msg
+                        ), make_check_ack_state(cls)
+                
+                # For other warnings, show message but continue
+                if user_message.startswith("Q:"):
+                    qa_result = OpenAIChat.QA(user_message, use_GPT4=True)
+                    response_text = user_msg + "\n\n" + qa_result if user_msg else qa_result
+                    return Result_ProcessUserInput(response=response_text), cls
+                else:
+                    # Continue with normal processing but prepend warning
+                    result, next_state = cls.step(user_message, **kwargs)
+                    if user_msg and result.response:
+                        result.response = user_msg + "\n\n" + result.response
+                    elif user_msg:
+                        result.response = user_msg
+                    
+                    # Store in history
+                    kwargs['memory']['message_history'].append(user_message)
+                    return result, next_state
+            
+            else:  # decision == 'allow'
+                # Process normally
+                # Handle Q: prefix before processing
                 if user_message.startswith("Q:"):
                     qa_result = OpenAIChat.QA(user_message, use_GPT4=True)
                     return Result_ProcessUserInput(response=qa_result), cls
-                else:
-                    return cls.step(user_message, **kwargs)
+                
+                # Store in history
+                kwargs['memory']['message_history'].append(user_message)
+                return cls.step(user_message, **kwargs)
+                    
         except Exception as ex:
             logger.info(["Error occured", ex])
             return (
@@ -300,26 +639,35 @@ class StateCheckACK(BaseUserInputState):
 
     def safe_step(cls, user_message, **kwargs):
         try:
-            stopping_result = check_stopping_keywords(user_message)
-            if stopping_result != "ok":
+            # Handle None or empty messages - skip safety check for system messages
+            if user_message is None or not isinstance(user_message, str):
+                if user_message is None:
+                    logger.debug("Received None message in StateCheckACK, skipping safety check")
+                    return cls.step(user_message, **kwargs)
+                
+            if(user_message.isdigit()):
+                return cls.step(user_message, **kwargs)
+                
+            # Use AI Safety Agent for ACK state as well
+            safety_agent = get_ai_safety_agent()
+            assessment = safety_agent.evaluate_request(
+                user_message, 
+                kwargs.get('memory', {})
+            )
+            
+            decision = assessment.get('decision', 'block')
+            user_msg = assessment.get('user_message', '')
+            
+            if decision == 'block':
                 return (
-                    Result_ProcessUserInput(status="error", response=stopping_result),
+                    Result_ProcessUserInput(status="error", response=user_msg),
                     cls,
                 )
-            elif check_human_heritable_editing(user_message) and (
-                not kwargs["memory"].get("flag_human_heritable_editing_ack", False)
-            ):
-                kwargs["memory"]["flag_human_heritable_editing_ack"] = True
-                kwargs["memory"]["cached_user_message_before_ack"] = user_message
-                return Result_ProcessUserInput(
-                    status="error", response=WARNING_HUMAN_HERITABLE_EDITING
-                ), make_check_ack_state(cls)
+            elif user_message.startswith("Q:"):
+                qa_result = OpenAIChat.QA(user_message, use_GPT4=True)
+                return Result_ProcessUserInput(response=qa_result), cls
             else:
-                if user_message.startswith("Q:"):
-                    qa_result = OpenAIChat.QA(user_message, use_GPT4=True)
-                    return Result_ProcessUserInput(response=qa_result), cls
-                else:
-                    return cls.step(user_message, **kwargs)
+                return cls.step(user_message, **kwargs)
         except Exception as ex:
             logger.info(["Error occured", ex])
             return (

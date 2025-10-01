@@ -85,8 +85,8 @@ conda activate crispr-gpt-new
 # Install dependencies
 pip install -r requirements.txt
 
-# Set up OpenAI API key
-echo "OPENAI_KEY=your_openai_api_key_here" > .env
+# Set up Google Gemini API key
+echo "GOOGLE_API_KEY=your_google_api_key_here" > .env
 
 # Run the application
 python main.py

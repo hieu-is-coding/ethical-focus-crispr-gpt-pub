@@ -56,13 +56,34 @@ def chat_respond(message, history):
         if not message.strip():
             return history, ""
         
-        # Get bot response
-        bot_messages = concurrent_gradio_state_machine.loop(message, current_state)
+        print("--------------------------------\n",message,"\n--------------------------------")
         
-        # Add to history
-        for bot_msg in bot_messages:
-            history.append((message, str(bot_msg)))
-            message = None  # Only show user message once
+        # Check if user is acknowledging a warning with confirmation
+        if message.strip().lower() in ['confirm', 'yes', 'y', 'ok', 'proceed'] and history:
+            # Look for the last warning message in history
+            for i in range(len(history) - 1, -1, -1):
+                if history[i][1] and ("Warning:" in str(history[i][1]) or "WARNING:" in str(history[i][1])):
+                    # Find the original user message before this warning
+                    for j in range(i - 1, -1, -1):
+                        if history[j][0] and "Warning:" not in str(history[j][1]) and "WARNING:" not in str(history[j][1]):
+                            message = history[j][0]  # Use the original message
+                            print(f"Found original message: {message}")
+                            break
+                    break
+        
+        # Get bot response
+        # Ensure message is a string to avoid AttributeError in state machine
+        user_input = str(message) if message is not None else ""
+        bot_messages = concurrent_gradio_state_machine.loop(user_input, current_state)
+        
+        # Add to history - handle case where bot_messages might be None
+        if bot_messages:
+            for bot_msg in bot_messages:
+                history.append((message, str(bot_msg)))
+                message = None  # Only show user message once
+        else:
+            # If no bot messages, just add a generic response
+            history.append((message, "Processing complete."))
         
         # Save chat
         save_chat(history, current_session_id)
@@ -104,7 +125,7 @@ with gr.Blocks(title="CRISPR-GPT", theme=gr.themes.Soft(), css=custom_css) as de
     gr.Markdown("*AI Assistant for gene editing*")
     
     chatbot = gr.Chatbot(
-        height=600,
+        height=1100,
         show_copy_button=True,
         type="tuples"  # Use tuples for better compatibility
     )
