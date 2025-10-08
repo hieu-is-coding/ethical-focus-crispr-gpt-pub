@@ -95,6 +95,10 @@ class SemanticSafetyFilter:
             "virus": [
                 'Ebola', 'Smallpox', 'Marburg virus', 'SARS-CoV-2', 'HIV',
                 'Influenza', 'MERS', 'Hepatitis B Virus', 'Hepatitis C Virus',
+                'Respiratory Syncytial Virus', 'RSV', 'Parainfluenza virus', 'Adenovirus', 'Poliovirus', 'Coxsackievirus', 'Rift Valley Fever virus', 'RVFV',
+                'Tick-borne Encephalitis Virus', 'TBEV', 'Venezuelan Equine Encephalitis virus', 'VEEV', 'Eastern Equine Encephalitis Virus', 'EEEV',
+                'Western Equine Encephalitis Virus', 'WEEV', 'Saint Louis Encephalitis virus', 'SLEV', 'Kyasanur Forest Disease Virus', 'KFDV',
+                'Omsk Hemorrhagic Fever Virus', 'OHFV', 'Enterovirus'
             ]
         }
 
