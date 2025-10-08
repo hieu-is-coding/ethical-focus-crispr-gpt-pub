@@ -9,12 +9,14 @@ from .safety import (
     contains_identifiable_genes,
     WARNING_PRIVACY,
     _check_contains_keyword_list,
+    SemanticSafetyFilter,
 )
 from util import get_logger
 import json
 
 logger = get_logger(__name__)
 
+_semantic_filter = SemanticSafetyFilter()
 
 @dataclass
 class Result_ProcessUserInput:
@@ -61,7 +63,8 @@ RESPONSE FORMAT (JSON):
     "tool_results": {
         "stopping_keywords": "ok or error message",
         "identifiable_genes": true/false,
-        "heritable_editing": true/false
+        "heritable_editing": true/false,
+        "semantic_safety": unsafe/safe,
     },
     "analysis": "Your detailed analysis beyond tool results",
     "red_flags": ["flag1", "flag2"],
@@ -124,7 +127,6 @@ Consider:
 Provide your response in valid JSON format matching the schema above."""
 
         try:
-            # Call AI agent (using GPT-4 as Gemini isn't in the llm.py)
             response = OpenAIChat.chat(prompt, use_GPT4=True)
             print("-----------  $    response: ", response)
             
@@ -186,6 +188,14 @@ Provide your response in valid JSON format matching the schema above."""
             logger.error(f"Tool error (heritable_editing): {e}")
             results['heritable_editing'] = False
         
+        # Tool 4: Check semantic safety
+        try:
+            semantic_result = _semantic_filter.check_semantic_safety(user_message)
+            results['semantic_safety'] = semantic_result
+        except Exception as e:
+            logger.error(f"Semantic safety error: {e}")
+            results['semantic_safety'] = {"unsafe": False}
+
         return results
     
     def _infer_decision(self, risk_level: str) -> str:
@@ -234,6 +244,7 @@ Provide your response in valid JSON format matching the schema above."""
         keyword_result = tool_results.get('stopping_keywords', 'ok')
         has_genes = tool_results.get('identifiable_genes', False)
         has_heritable = tool_results.get('heritable_editing', False)
+        semantic = tool_results.get('semantic_safety', {"unsafe": False})
         
         if keyword_result != 'ok':
             return {
@@ -255,6 +266,17 @@ Provide your response in valid JSON format matching the schema above."""
                 'analysis': 'Privacy violation detected',
                 'red_flags': ['Identifiable genetic sequence detected'],
                 'confidence': 0.9
+            }
+        
+        if semantic.get("unsafe"):
+            return {
+                "risk_level": "high",
+                "decision": "block",
+                "user_message": f"Semantic filter detected potential unsafe intent related to {semantic.get('label')}.",
+                "tool_results": tool_results,
+                "analysis": f"User message semantically matched unsafe term ({semantic.get('label')})",
+                "red_flags": [semantic.get('matched_text')],
+                "confidence": 0.9
             }
         
         if has_heritable:
@@ -411,30 +433,30 @@ class BaseUserInputState:
             
             elif decision == 'warn':
                 # For human heritable editing, use the existing ACK mechanism
-                if assessment.get('tool_results', {}).get('heritable_editing'):
-                    if not kwargs["memory"].get("flag_human_heritable_editing_ack", False):
-                        kwargs["memory"]["flag_human_heritable_editing_ack"] = True
-                        kwargs["memory"]["cached_user_message_before_ack"] = user_message
-                        return Result_ProcessUserInput(
-                            status="error", response=user_msg
-                        ), make_check_ack_state(cls)
+                # if assessment.get('tool_results', {}).get('heritable_editing'):
+                #     if not kwargs["memory"].get("flag_human_heritable_editing_ack", False):
+                #         kwargs["memory"]["flag_human_heritable_editing_ack"] = True
+                #         kwargs["memory"]["cached_user_message_before_ack"] = user_message
+                #         return Result_ProcessUserInput(
+                #             status="error", response=user_msg
+                #         ), make_check_ack_state(cls)
                 
                 # For other warnings, show message but continue
-                if user_message.startswith("Q:"):
-                    qa_result = OpenAIChat.QA(user_message, use_GPT4=True)
-                    response_text = user_msg + "\n\n" + qa_result if user_msg else qa_result
-                    return Result_ProcessUserInput(response=response_text), cls
-                else:
-                    # Continue with normal processing but prepend warning
-                    result, next_state = cls.step(user_message, **kwargs)
-                    if user_msg and result.response:
-                        result.response = user_msg + "\n\n" + result.response
-                    elif user_msg:
-                        result.response = user_msg
-                    
-                    # Store in history
-                    kwargs['memory']['message_history'].append(user_message)
-                    return result, next_state
+                # if user_message.startswith("Q:"):
+                #     qa_result = OpenAIChat.QA(user_message, use_GPT4=True)
+                #     response_text = user_msg + "\n\n" + qa_result if user_msg else qa_result
+                #     return Result_ProcessUserInput(response=response_text), cls
+                # else:
+                # Continue with normal processing but prepend warning
+                result, next_state = cls.step(user_message, **kwargs)
+                if user_msg and result.response:
+                    result.response = user_msg + "\n\n" + result.response
+                elif user_msg:
+                    result.response = user_msg
+                
+                # Store in history
+                kwargs['memory']['message_history'].append(user_message)
+                return result, next_state
             
             else:  # decision == 'allow'
                 # Process normally

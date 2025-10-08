@@ -63,3 +63,74 @@ def check_stopping_keywords(request):
             return "We cannot process the input. Reason: " + item['reason']
 
     return 'ok'
+
+
+# New update
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+import numpy as np
+import faiss
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+google_api_key = os.getenv("GOOGLE_API_KEY")
+
+class SemanticSafetyFilter:
+    def __init__(self, threshold=0.89):
+        self.threshold = threshold
+        self.embed_model = GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            google_api_key=google_api_key
+        )
+        self.keyword_dict = self._load_keywords()
+        self.index, self.id_to_label = self._build_index()
+
+    def _load_keywords(self):
+        """Extract all keyword lists from safety.py logic."""
+        return {
+            "human_heritable": ['baby', 'child', 'kid'],
+            "germline": ['human sperm', 'human egg', 'human oocyte', 'human embryo', 'CRISPR baby', 'Gene-edited baby',
+            'Designer baby', 'Germline modification', 'Inheritable human genetic modification', 'heritable human genetic alteration',
+            'human genetic enhancement', 'Reproductive human cloning', 'Gene doping'],
+            "virus": [
+                'Ebola', 'Smallpox', 'Marburg virus', 'SARS-CoV-2', 'HIV',
+                'Influenza', 'MERS', 'Hepatitis B Virus', 'Hepatitis C Virus',
+            ]
+        }
+
+    def _build_index(self):
+        """Embed and index all safety-related keywords."""
+        labels, texts = [], []
+        for cat, words in self.keyword_dict.items():
+            for w in words:
+                labels.append(cat)
+                texts.append(w)
+
+        vectors = self.embed_model.embed_documents(texts)
+        dim = len(vectors[0])
+        index = faiss.IndexFlatL2(dim)
+        index.add(np.array(vectors).astype('float32'))
+
+        return index, labels
+
+    def check_semantic_safety(self, user_input: str):
+        """Return the most similar unsafe keyword and score."""
+        # Split input into phrases to capture context
+        sentences = re.split(r'[.;,\n]', user_input)
+        embeddings = self.embed_model.embed_documents(sentences)
+
+        for sent_vec, sent_text in zip(embeddings, sentences):
+            sent_vec = np.array([sent_vec]).astype('float32')
+            distances, indices = self.index.search(sent_vec, 1)
+            score = 1 - distances[0][0] / 2  # Convert distance to similarity approx
+            label = self.id_to_label[indices[0][0]]
+            if score >= self.threshold:
+                return {
+                    "unsafe": True,
+                    "label": label,
+                    "score": float(score),
+                    "matched_text": sent_text.strip()
+                }
+
+        return {"unsafe": False}
+
